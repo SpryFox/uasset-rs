@@ -353,6 +353,16 @@ where
     pub fn new(reader: R) -> Result<Self> {
         let mut archive = Archive::new(reader)?;
 
+        // If >= PACKAGE_SAVED_HASH, SavedHash (FIoHash, 20 bytes) and TotalHeaderSize are written
+        // before the CustomVersionContainer (see FPackageFileSummary serialization in PackageFileSummary.cpp).
+        let early_total_header_size: Option<i32> =
+            if archive.serialized_with(ObjectVersionUE5::PACKAGE_SAVED_HASH) {
+                archive.seek(SeekFrom::Current(20))?; // Skip FIoHash SavedHash
+                Some(archive.read_le()?)
+            } else {
+                None
+            };
+
         // Parse and seek past `CustomVersionContainer`
         let custom_versions_stream_info = ArrayStreamInfo::from_current_position(&mut archive)?;
         match archive.custom_version_serialization_format() {
@@ -370,7 +380,11 @@ where
             }
         }
 
-        let total_header_size = archive.read_le()?;
+        let total_header_size = if let Some(v) = early_total_header_size {
+            v
+        } else {
+            archive.read_le()?
+        };
 
         let package_name = UnrealString::parse_inline(&mut archive)?;
 
@@ -414,6 +428,19 @@ where
 
         let imports = UnrealArray::<UnrealClassImport>::parse_indirect(&mut archive)?;
 
+        // Added in UE5.6: Verse cell export/import counts and offsets
+        if archive.serialized_with(ObjectVersionUE5::VERSE_CELLS) {
+            let _cell_export_count: i32 = archive.read_le()?;
+            let _cell_export_offset: i32 = archive.read_le()?;
+            let _cell_import_count: i32 = archive.read_le()?;
+            let _cell_import_offset: i32 = archive.read_le()?;
+        }
+
+        // Added in UE5.6: metadata serialization offset
+        if archive.serialized_with(ObjectVersionUE5::METADATA_SERIALIZATION_OFFSET) {
+            let _metadata_offset: i32 = archive.read_le()?;
+        }
+
         let depends_offset = archive.read_le()?;
 
         let has_string_asset_references_map =
@@ -435,7 +462,10 @@ where
 
         let thumbnail_table_offset = archive.read_le()?;
 
-        let _guid = UnrealGuid::seek_past(&mut archive)?;
+        // < PACKAGE_SAVED_HASH writes an FGuid here; >= PACKAGE_SAVED_HASH uses SavedHash written before custom versions
+        if archive.serialized_without(ObjectVersionUE5::PACKAGE_SAVED_HASH) {
+            let _guid = UnrealGuid::seek_past(&mut archive)?;
+        }
         let supports_package_owner =
             archive.serialized_with(ObjectVersion::VER_UE4_ADDED_PACKAGE_OWNER);
         if supports_package_owner && has_editor_only_data {

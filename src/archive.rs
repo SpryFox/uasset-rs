@@ -38,7 +38,7 @@ where
 
         // See `void operator<<(FStructuredArchive::FSlot Slot, FPackageFileSummary& Sum)` in Engine/Source/Runtime/CoreUObject/Private/UObject/PackageFileSummary.cpp
         let legacy_version: i32 = reader.read_le()?;
-        if !(-8..=-5).contains(&legacy_version) {
+        if !(-9..=-5).contains(&legacy_version) {
             return Err(Error::UnsupportedVersion(legacy_version));
         }
 
