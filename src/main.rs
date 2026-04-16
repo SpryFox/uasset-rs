@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, ensure, Result};
-use log::{error, trace};
-use serde::{Deserialize, Deserializer};
+use log::{error, trace, warn};
+use serde::{Deserialize, Deserializer, Serialize};
 use simplelog::{Config, TermLogger, TerminalMode};
 use std::{
     fs::File,
@@ -9,13 +9,15 @@ use std::{
     path::{Path, PathBuf},
     time,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use structopt::StructOpt;
 use structopt_flags::LogLevel;
 use tempfile::TempDir;
-use uasset::{AssetHeader, ObjectReference};
+use uasset::{AssetHeader, ObjectExport, ObjectReference};
 use walkdir::WalkDir;
 use uasset::enums::ObjectFlags;
+
+mod fproperty;
 
 const UASSET_EXTENSIONS: [&str; 2] = ["uasset", "umap"];
 
@@ -129,6 +131,27 @@ enum Command {
         /// Assets to dump thumbnail info for, directories will be recursively searched for assets
         assets_or_directories: Vec<PathBuf>,
     },
+    /// List component types and tags from Blueprint assets
+    ListBlueprintComponents {
+        /// Blueprint assets to inspect, directories will be recursively searched for assets
+        assets_or_directories: Vec<PathBuf>,
+    },
+}
+
+#[derive(Serialize)]
+struct ComponentInfo {
+    class: String,
+    tags: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BlueprintInfo {
+    components: Vec<ComponentInfo>,
+    parent: Option<String>,
+    /// Populated when the asset could not be parsed, so downstream consumers
+    /// can distinguish "no components" from "parse failed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 fn recursively_walk_uassets(paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -519,7 +542,239 @@ fn main() -> Result<()> {
                 });
             }
         }
+        Command::ListBlueprintComponents {
+            assets_or_directories,
+        } => {
+            let asset_paths = recursively_walk_uassets(assets_or_directories);
+            // BTreeMap so JSON output has deterministic key order — otherwise
+            // diffing two runs (e.g. across commits) is noise.
+            let mut results: BTreeMap<String, BlueprintInfo> = BTreeMap::new();
+            for asset_path in asset_paths {
+                let key = asset_path.display().to_string();
+                let info = match try_parse(&asset_path) {
+                    Ok(mut header) => extract_blueprint_info(&mut header),
+                    Err(error) => {
+                        error!("{}", error);
+                        BlueprintInfo {
+                            components: vec![],
+                            parent: None,
+                            error: Some(format!("{}", error)),
+                        }
+                    }
+                };
+                results.insert(key, info);
+            }
+            println!("{json}", json = serde_json::to_string(&results)?);
+        }
     }
 
     Ok(())
+}
+
+/// Maximum depth when walking an import's outer chain or an export's
+/// `Default__` class chain. Bounds protect against corrupt or cyclic asset
+/// metadata that would otherwise cause an infinite loop.
+const MAX_CHAIN_DEPTH: usize = 16;
+
+/// Resolve an import's name lazily. Avoids the eager
+/// `Vec<String>` allocation of every import name in the file — callers
+/// typically look up a handful of positions, not all of them.
+fn import_name<R>(header: &AssetHeader<R>, idx: usize) -> Option<String> {
+    let import = header.imports.get(idx)?;
+    header.resolve_name(&import.object_name).ok().map(|s| s.to_string())
+}
+
+/// Get the package path for an import by walking up its outer chain to the root package.
+fn resolve_import_package<R>(header: &AssetHeader<R>, import_index: usize) -> Option<String> {
+    let mut current = import_index;
+    for _ in 0..MAX_CHAIN_DEPTH {
+        let import = header.imports.get(current)?;
+        match import.outer() {
+            ObjectReference::Import { import_index: outer } => {
+                current = outer;
+            }
+            _ => {
+                return header.resolve_name(&import.object_name).ok().map(|s| s.to_string());
+            }
+        }
+    }
+    warn!("resolve_import_package: exceeded max chain depth starting at import {}", import_index);
+    None
+}
+
+/// Resolve the class name of an export, following the `Default__` indirection
+/// used by inherited component overrides. Walks up to `MAX_CHAIN_DEPTH` hops
+/// for deeply nested BP inheritance; without a bound a cyclic asset would
+/// loop forever, and without a loop a two-deep inheritance chain would be
+/// silently misresolved (components dropped).
+fn resolve_export_class_name<R>(
+    header: &AssetHeader<R>,
+    export: &ObjectExport,
+) -> Option<String> {
+    let mut current_class = export.class();
+    let mut last_name: Option<String> = None;
+    for _ in 0..MAX_CHAIN_DEPTH {
+        match current_class {
+            ObjectReference::Import { import_index } => {
+                return import_name(header, import_index);
+            }
+            ObjectReference::Export { export_index } => {
+                let inner = header.exports.get(export_index)?;
+                let resolved = header
+                    .resolve_name(&inner.object_name)
+                    .ok()
+                    .map(|s| s.to_string());
+                match resolved {
+                    Some(name) if name.starts_with("Default__") => {
+                        last_name = Some(name);
+                        current_class = inner.class();
+                    }
+                    Some(name) => return Some(name),
+                    None => return last_name,
+                }
+            }
+            ObjectReference::None => return last_name,
+        }
+    }
+    last_name
+}
+
+/// Extract component info and parent Blueprint from a parsed asset header.
+fn extract_blueprint_info<R: std::io::Read + std::io::Seek>(
+    header: &mut AssetHeader<R>,
+) -> BlueprintInfo {
+    // Resolve every export's class name once and reuse across the main,
+    // canary, and trace passes below. Resolution walks imports + exports,
+    // so doing it per-pass was ~3x redundant work on large assets.
+    let class_names: Vec<Option<String>> = header
+        .exports
+        .iter()
+        .map(|export| resolve_export_class_name(header, export))
+        .collect();
+
+    let mut components = Vec::new();
+
+    // If the file's name table doesn't contain `ComponentTags` / `ArrayProperty`
+    // at all, no export can possibly carry the property we extract. Skip the
+    // whole per-export scan.
+    if let Some(indices) = fproperty::NameIndices::lookup(&header.names) {
+        // Canary enabled only when the user has raised verbosity (-v). Scanning
+        // every rejected export's serial bytes costs real I/O, and the sweep we
+        // ran over Content/Entities + Content/Blueprints produced zero hits, so
+        // running it by default would pay that cost for no benefit. With -v it
+        // stays available as a regression check when content changes.
+        let canary_enabled = log::log_enabled!(log::Level::Info);
+
+        let component_exports: Vec<(usize, String)> = class_names
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, class)| {
+                let name = class.as_ref()?;
+                name.ends_with("Component").then(|| (idx, name.clone()))
+            })
+            .collect();
+
+        for (export_idx, class_name) in component_exports {
+            let export = &header.exports[export_idx];
+            let serial_offset = export.serial_offset as u64;
+            let serial_size = export.serial_size as u64;
+            let tags = fproperty::extract_component_tags(
+                &mut header.archive,
+                &indices,
+                &header.names,
+                serial_offset,
+                serial_size,
+            );
+            if !tags.is_empty() {
+                components.push(ComponentInfo { class: class_name, tags });
+            }
+        }
+
+        if canary_enabled {
+            let rejected: Vec<(usize, String, String)> = class_names
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, class)| {
+                    let class = class.as_ref()?;
+                    if class.ends_with("Component") {
+                        return None;
+                    }
+                    let export = header.exports.get(idx)?;
+                    let name = header
+                        .resolve_name(&export.object_name)
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    Some((idx, name, class.clone()))
+                })
+                .collect();
+
+            for (export_idx, export_name, class) in rejected {
+                let export = &header.exports[export_idx];
+                if fproperty::serial_contains_component_tags_name(
+                    &mut header.archive,
+                    indices.component_tags,
+                    export.serial_offset as u64,
+                    export.serial_size as u64,
+                ) {
+                    warn!(
+                        "export[{}] name={:?} class={:?} rejected by class filter but serial contains ComponentTags; filter may miss a component",
+                        export_idx, export_name, class
+                    );
+                }
+            }
+        }
+    }
+
+    if log::log_enabled!(log::Level::Trace) {
+        for (export_idx, export) in header.exports.iter().enumerate() {
+            let class = class_names[export_idx].as_deref().unwrap_or("(none)");
+            let export_name = header
+                .resolve_name(&export.object_name)
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            if class.contains("Component")
+                || class.contains("Mesh")
+                || export_name.contains("Mesh")
+                || export_name.contains("Component")
+            {
+                trace!(
+                    "export[{}]: name={:?} class={:?} offset={} size={}",
+                    export_idx, export_name, class, export.serial_offset, export.serial_size
+                );
+            }
+        }
+    }
+
+    let parent = find_parent_blueprint(header);
+    BlueprintInfo { components, parent, error: None }
+}
+
+/// Find the parent Blueprint package path by tracing the generated class's super_index.
+fn find_parent_blueprint<R>(header: &AssetHeader<R>) -> Option<String> {
+    let bgc_import_idx = header.imports.iter().position(|imp| {
+        matches!(
+            header.resolve_name(&imp.object_name).ok().as_deref(),
+            Some("BlueprintGeneratedClass")
+        )
+    })?;
+
+    let gen_class_export = header.exports.iter().find(|export| {
+        matches!(
+            export.class(),
+            ObjectReference::Import { import_index } if import_index == bgc_import_idx
+        )
+    })?;
+
+    match gen_class_export.superclass() {
+        ObjectReference::Import { import_index } => {
+            let package_path = resolve_import_package(header, import_index)?;
+            // Only return Blueprint parents (from /Game/), not C++ parents (from /Script/).
+            if package_path.starts_with("/Game/") {
+                Some(package_path)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
