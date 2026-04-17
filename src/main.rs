@@ -749,7 +749,7 @@ fn extract_blueprint_info<R: std::io::Read + std::io::Seek>(
     BlueprintInfo { components, parent, error: None }
 }
 
-/// Find the parent Blueprint package path by tracing the generated class's super_index.
+/// Find the parent Blueprint package path by tracing the generated class's `super_index`.
 fn find_parent_blueprint<R>(header: &AssetHeader<R>) -> Option<String> {
     let bgc_import_idx = header.imports.iter().position(|imp| {
         matches!(

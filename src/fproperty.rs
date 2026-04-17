@@ -4,22 +4,22 @@ use std::io::{Read, Seek, SeekFrom};
 /// sanity bound to reject garbage bytes that happen to decode as a count.
 const MAX_ARRAY_COUNT: i32 = 64;
 
-/// Upper bound on FName.number for heuristic validation. Real FName numbers
-/// above this are exceedingly rare in serialized assets, and any value
-/// approaching `i32::MAX` is near-certainly random bytes.
+/// Upper bound on `FName.number` for heuristic validation. Real `FName`
+/// numbers above this are exceedingly rare in serialized assets, and any
+/// value approaching `i32::MAX` is near-certainly random bytes.
 const MAX_PLAUSIBLE_FNAME_NUMBER: i32 = 1_000_000;
 
-/// Window (in bytes) after the `ComponentTags + ArrayProperty` FName pair
-/// within which the ArrayProperty's `InnerType` FName (`NameProperty`) is
-/// expected. Bounded so we don't match an unrelated occurrence later in the
-/// blob.
+/// Window (in bytes) after the `ComponentTags + ArrayProperty` `FName` pair
+/// within which the `ArrayProperty`'s `InnerType` `FName` (`NameProperty`)
+/// is expected. Bounded so we don't match an unrelated occurrence later in
+/// the blob.
 const INNER_TYPE_WINDOW: usize = 64;
 
-/// Precomputed name-table indices for the FNames we look for. Computing these
-/// once per file avoids repeated linear scans of the name table per export.
-/// Returns `None` if `ComponentTags` or `ArrayProperty` are absent from the
-/// name table — in which case no export in this file can possibly carry the
-/// property we care about, and all extraction can be skipped.
+/// Precomputed name-table indices for the `FName`s we look for. Computing
+/// these once per file avoids repeated linear scans of the name table per
+/// export. Returns `None` if `ComponentTags` or `ArrayProperty` are absent
+/// from the name table — in which case no export in this file can possibly
+/// carry the property we care about, and all extraction can be skipped.
 pub struct NameIndices {
     pub component_tags: i32,
     pub array_property: i32,
@@ -39,18 +39,18 @@ impl NameIndices {
 /// of its `ComponentTags` property (an `ArrayProperty` of `NameProperty`).
 ///
 /// The UE tagged-property layout for `ArrayProperty` has varied across engine
-/// versions (UE5.3+ introduced EPropertyTagFlags), so rather than attempt to
-/// decode every variant of the tag header, this uses a heuristic:
+/// versions (UE5.3+ introduced `EPropertyTagFlags`), so rather than attempt
+/// to decode every variant of the tag header, this uses a heuristic:
 ///
 /// 1. Find the byte pattern `FName(ComponentTags, 0) + FName(ArrayProperty, 0)`
 ///    within the export's serial data.
 /// 2. From that point, scan forward for an `i32 count` in a plausible range
-///    whose `count` following 8-byte slots all decode as valid FNames.
+///    whose `count` following 8-byte slots all decode as valid `FName`s.
 /// 3. Double-ended check: the 8 bytes immediately after the array must also
-///    decode as a valid FName (the next property's name, or the `None`
+///    decode as a valid `FName` (the next property's name, or the `None`
 ///    terminator). This rules out random-byte coincidences where the "tags"
 ///    parse but the surrounding context is garbage.
-/// 4. Emit those FNames as tag strings.
+/// 4. Emit those `FName`s as tag strings.
 ///
 /// Returns an empty vec on any error or if the property is absent.
 pub fn extract_component_tags<R: Read + Seek>(
@@ -98,10 +98,11 @@ fn try_extract_at(
     if let Some(np_idx) = indices.name_property {
         let inner_needle = fname_bytes(np_idx);
         let window_end = (scan_start + INNER_TYPE_WINDOW).min(data.len());
-        if scan_start < window_end {
-            if let Some(pos) = find_subsequence(&data[scan_start..window_end], &inner_needle) {
-                scan_start = scan_start + pos + 8;
-            }
+        if let Some(pos) = data
+            .get(scan_start..window_end)
+            .and_then(|slice| find_subsequence(slice, &inner_needle))
+        {
+            scan_start = scan_start + pos + 8;
         }
     }
     let scan_end = data.len().saturating_sub(4);
@@ -155,9 +156,9 @@ fn try_extract_at(
     None
 }
 
-/// Cheap check: does the export's serial blob contain the FName pattern for
-/// `ComponentTags`? Used by the export-scan canary to flag exports that were
-/// filtered out by class-name heuristics but which nonetheless carry a
+/// Cheap check: does the export's serial blob contain the `FName` pattern
+/// for `ComponentTags`? Used by the export-scan canary to flag exports that
+/// were filtered out by class-name heuristics but which nonetheless carry a
 /// `ComponentTags` property (i.e. a class that breaks UE's
 /// `*Component`-suffix naming convention).
 pub fn serial_contains_component_tags_name<R: Read + Seek>(
